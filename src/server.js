@@ -2,283 +2,332 @@ const express = require("express");
 const cors = require("cors");
 const path = require("path");
 const multer = require("multer");
+const http = require("http");
+const { Server } = require("socket.io");
 
 const sessionState = require("./sessionStore");
 const imageService = require("./services/imageService");
+const { startUdpRelay } = require("./udpRelay");
 
 const app = express();
+const server = http.createServer(app);
+
+// ==========================
+// SOCKET.IO INITIALIZATION
+// ==========================
+const io = new Server(server, {
+  path: "/socket.io",
+  serveClient: false,
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST", "DELETE", "OPTIONS"],
+    credentials: false,
+  },
+  transports: ["polling", "websocket"],
+});
+
+console.log("🔌 Socket.IO server initialized on shared HTTP server");
+
+io.engine.on("connection_error", (err) => {
+  console.error("⚠️ Socket.IO engine connection_error:", err?.message || err);
+});
+
+io.engine.on("headers", (headers, req) => {
+  console.log("[Socket.IO] handshake headers", req.url, "origin=", req.headers.origin);
+});
 
 // ==========================
 // MIDDLEWARE
 // ==========================
-
-app.use(cors());
+app.use(cors({ origin: true, credentials: false }));
 app.use(express.json());
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-// Serve static files from uploads folder
+// Static uploads
 app.use("/uploads", express.static(path.join(__dirname, "../uploads")));
 
-// Configure multer for image uploads
+// ==========================
+// MULTER
+// ==========================
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    // Allow only image files
-    if (file.mimetype.startsWith("image/")) {
+    if (file.mimetype && file.mimetype.startsWith("image/")) {
       cb(null, true);
     } else {
       cb(new Error("Only image files are allowed"));
     }
-  }
+  },
 });
 
 // ==========================
-// ROOT
+// SOCKET.IO CONNECTION HANDLER
 // ==========================
+io.on("connection", (socket) => {
+  console.log(
+    "🔌 [Socket] connected",
+    socket.id,
+    "transport=",
+    socket.conn.transport.name,
+    "origin=",
+    socket.handshake.headers.origin
+  );
 
+  socket.conn.on("upgrade", (transport) => {
+    console.log(
+      "🔼 [Socket] transport upgraded",
+      socket.id,
+      "=>",
+      transport.name
+    );
+  });
+
+  socket.on("disconnect", (reason) => {
+    console.log("🔌 [Socket] disconnected", socket.id, "reason=", reason);
+  });
+
+  socket.emit("session-status", {
+    active: sessionState.active,
+    status: sessionState.status,
+    startedAt: sessionState.startedAt,
+  });
+
+  socket.on("audio:owner", (data) => {
+    console.log("🎤 [Audio] owner received", {
+      hasAudio: !!data?.audio,
+      format: data?.format,
+      from: socket.id,
+    });
+    socket.broadcast.emit("audio:owner", data);
+  });
+
+  socket.on("audio:owner:start", () => {
+    console.log("🎙️ [Audio] owner started talking");
+    socket.broadcast.emit("audio:owner:start");
+  });
+
+  socket.on("audio:owner:stop", () => {
+    console.log("✋ [Audio] owner stopped talking");
+    socket.broadcast.emit("audio:owner:stop");
+  });
+
+  socket.on("audio:visitor", (data) => {
+    console.log("🎤 [Audio] visitor received", {
+      hasAudio: !!data?.audio,
+      format: data?.format,
+      from: socket.id,
+    });
+    socket.broadcast.emit("audio:visitor", data);
+  });
+
+  socket.on("audio:visitor:start", () => {
+    console.log("🎙️ [Audio] visitor started talking");
+    socket.broadcast.emit("audio:visitor:start");
+  });
+
+  socket.on("audio:visitor:stop", () => {
+    console.log("✋ [Audio] visitor stopped talking");
+    socket.broadcast.emit("audio:visitor:stop");
+  });
+
+  socket.on("audio-to-doorbell", (audioChunk) => {
+    console.log("📡 [Audio] relay audio-to-doorbell");
+    socket.broadcast.emit("audio-to-doorbell", audioChunk);
+  });
+
+  socket.on("audio-to-app", (audioChunk) => {
+    console.log("📡 [Audio] relay audio-to-app");
+    socket.broadcast.emit("audio-to-app", audioChunk);
+  });
+});
+
+// ==========================
+// REST ROUTES
+// ==========================
 app.get("/", (req, res) => {
   res.send("Smart Doorbell Backend Running 🚀");
 });
 
-// ==========================
-// RING API
-// ==========================
-
 app.post("/ring", (req, res) => {
-
-  console.log("🔔 Doorbell Ring Received");
+  console.log("🔔 [API] Doorbell Ring Received");
 
   sessionState.active = true;
   sessionState.status = "ringing";
   sessionState.startedAt = Date.now();
 
-  res.json({
+  io.emit("doorbell:ring", {
     success: true,
-    message: "Doorbell Ring Received"
+    message: "Doorbell Ring Received",
+    active: sessionState.active,
+    status: sessionState.status,
+    startedAt: sessionState.startedAt,
   });
 
+  res.json({
+    success: true,
+    message: "Doorbell Ring Received",
+  });
 });
 
-// ==========================
-// SESSION STATUS API
-// ==========================
-
 app.get("/session-status", (req, res) => {
-
   res.json({
     active: sessionState.active,
     status: sessionState.status,
-    startedAt: sessionState.startedAt
+    startedAt: sessionState.startedAt,
   });
-
 });
 
-// ==========================
-// ACCEPT CALL
-// ==========================
-
 app.post("/accept", (req, res) => {
-
-  console.log("✅ Owner Accepted Call");
+  console.log("✅ [API] Owner Accepted Call");
 
   sessionState.status = "connected";
 
-  res.json({
-    success: true,
-    message: "Call Accepted"
+  io.emit("session-status", {
+    active: sessionState.active,
+    status: sessionState.status,
+    startedAt: sessionState.startedAt,
   });
 
+  res.json({
+    success: true,
+    message: "Call Accepted",
+  });
 });
 
-// ==========================
-// END CALL
-// ==========================
-
 app.post("/end", (req, res) => {
-
-  console.log("❌ Call Ended");
+  console.log("❌ [API] Call Ended");
 
   sessionState.active = false;
   sessionState.status = "idle";
   sessionState.startedAt = null;
 
-  res.json({
-    success: true,
-    message: "Call Ended"
+  // Reset UDP peer registry so next call registers fresh IPs
+  if (udpRelay) udpRelay.resetPeers();
+
+  io.emit("session-status", {
+    active: sessionState.active,
+    status: sessionState.status,
+    startedAt: sessionState.startedAt,
   });
 
+  io.emit("call-ended", {
+    success: true,
+    message: "Call Ended",
+  });
+
+  res.json({
+    success: true,
+    message: "Call Ended",
+  });
 });
 
-// ==========================
-// UPLOAD IMAGE API (ESP32-CAM)
-// ==========================
-
-/**
- * POST /upload-image
- * Receives image from ESP32-CAM and saves it
- * Returns the saved image URL for React Native app
- *
- * Expected request:
- * - multipart/form-data with 'image' field containing the image file
- * - Optional: deviceId, timestamp in form data
- *
- * Response:
- * {
- *   success: true,
- *   filename: "image_1234567890_abcd1234.jpg",
- *   url: "http://54.237.213.192:3000/uploads/image_1234567890_abcd1234.jpg",
- *   timestamp: 1234567890,
- *   size: 45678
- * }
- */
 app.post("/upload-image", upload.single("image"), (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({
         success: false,
-        error: "No image file provided"
+        error: "No image file provided",
       });
     }
 
-    console.log(`📸 Image upload received from device`);
-    console.log(`   File: ${req.file.originalname}`);
-    console.log(`   Size: ${req.file.size} bytes`);
+    console.log("📸 [API] Image upload received from device");
+    console.log(`    File: ${req.file.originalname}`);
+    console.log(`    Size: ${req.file.size} bytes`);
 
-    // Save the image using imageService
-    const result = imageService.saveImage(
-      req.file.buffer,
-      req.file.originalname
-    );
+    const result = imageService.saveImage(req.file.buffer, req.file.originalname);
 
     if (result.success) {
+      io.emit("new-image", result);
       res.json(result);
     } else {
       res.status(500).json(result);
     }
   } catch (error) {
-    console.error("❌ Upload error:", error.message);
+    console.error("❌ [API] Upload error:", error.message);
     res.status(500).json({
       success: false,
-      error: error.message
+      error: error.message,
     });
   }
 });
 
-// ==========================
-// GET ALL IMAGES API (Mobile App)
-// ==========================
-
-/**
- * GET /get-images
- * Retrieves list of all uploaded images
- * Used by React Native app to display image gallery
- *
- * Response:
- * [
- *   {
- *     filename: "image_1234567890_abcd1234.jpg",
- *     url: "http://54.237.213.192:3000/uploads/image_1234567890_abcd1234.jpg",
- *     size: 45678,
- *     created: "2024-01-15T10:30:45.000Z",
- *     modified: "2024-01-15T10:30:45.000Z"
- *   },
- *   ...
- * ]
- */
 app.get("/get-images", (req, res) => {
   try {
     const images = imageService.getImages();
     res.json({
       success: true,
       count: images.length,
-      images: images
+      images,
     });
   } catch (error) {
-    console.error("❌ Error fetching images:", error.message);
+    console.error("❌ [API] Error fetching images:", error.message);
     res.status(500).json({
       success: false,
-      error: error.message
+      error: error.message,
     });
   }
 });
 
-// ==========================
-// DELETE IMAGE API (Mobile App)
-// ==========================
-
-/**
- * DELETE /delete-image/:filename
- * Deletes a specific image by filename
- * Used by React Native app to remove images
- *
- * Response:
- * {
- *   success: true,
- *   message: "Image deleted"
- * }
- */
 app.delete("/delete-image/:filename", (req, res) => {
   try {
     const { filename } = req.params;
-
-    if (!filename) {
-      return res.status(400).json({
-        success: false,
-        error: "Filename is required"
-      });
-    }
-
     const result = imageService.deleteImage(filename);
 
     if (result.success) {
+      io.emit("image-deleted", { filename });
       res.json(result);
     } else {
       res.status(400).json(result);
     }
   } catch (error) {
-    console.error("❌ Error deleting image:", error.message);
+    console.error("❌ [API] Error deleting image:", error.message);
     res.status(500).json({
       success: false,
-      error: error.message
+      error: error.message,
     });
   }
 });
 
-// ==========================
-// AUTO TIMEOUT
-// ==========================
-
 setInterval(() => {
-
-  if (
-    sessionState.active &&
-    sessionState.status === "ringing"
-  ) {
-
+  if (sessionState.active && sessionState.status === "ringing") {
     const currentTime = Date.now();
-
     const diff = currentTime - sessionState.startedAt;
 
-    // 1 minute timeout
     if (diff > 60000) {
-
-      console.log("⌛ No response. Session auto closed.");
-
+      console.log("⌛ [Session] No response. Session auto closed.");
       sessionState.active = false;
       sessionState.status = "idle";
       sessionState.startedAt = null;
+
+      io.emit("session-status", {
+        active: sessionState.active,
+        status: sessionState.status,
+        startedAt: sessionState.startedAt,
+      });
     }
   }
-
 }, 5000);
 
-// ==========================
-// START SERVER
-// ==========================
+const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || "0.0.0.0";
 
-const PORT = 3000;
+server.on("upgrade", (req, socket, head) => {
+  console.log("⬆️ HTTP upgrade request", { url: req.url, origin: req.headers.origin });
+});
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+server.on("error", (error) => {
+  console.error("❌ Server error:", error);
+});
+
+// ── Start UDP Audio Relay ──────────────────────────────────────────────────
+let udpRelay = null;
+
+server.listen(PORT, HOST, () => {
+  console.log(`🚀 Server running on http://${HOST}:${PORT}`);
+  console.log(`📡 Socket.IO path: /socket.io`);
+  console.log(`🎯 Socket.IO transports: polling, websocket`);
+
+  // Start UDP relay after HTTP server is ready
+  udpRelay = startUdpRelay();
 });
