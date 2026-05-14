@@ -1,19 +1,25 @@
-const express = require("express");
-const cors = require("cors");
-const path = require("path");
-const multer = require("multer");
-const http = require("http");
+// ==========================
+// IMPORTS — declared once at the top
+// ==========================
+const express    = require("express");
+const cors       = require("cors");
+const path       = require("path");
+const http       = require("http");
+const multer     = require("multer");
 const { Server } = require("socket.io");
 
-const sessionState = require("./sessionStore");
-const imageService = require("./services/imageService");
-const { startUdpRelay } = require("./udpRelay");
+const sessionState          = require("./sessionStore");
+const imageService          = require("./services/imageService");
+const { startUdpRelay }     = require("./udpRelay");
 
-const app = express();
+// ==========================
+// APP + HTTP SERVER
+// ==========================
+const app    = express();
 const server = http.createServer(app);
 
 // ==========================
-// SOCKET.IO INITIALIZATION
+// SOCKET.IO
 // ==========================
 const io = new Server(server, {
   path: "/socket.io",
@@ -29,7 +35,7 @@ const io = new Server(server, {
 console.log("🔌 Socket.IO server initialized on shared HTTP server");
 
 io.engine.on("connection_error", (err) => {
-  console.error("⚠️ Socket.IO engine connection_error:", err?.message || err);
+  console.error("⚠️  Socket.IO engine connection_error:", err?.message || err);
 });
 
 io.engine.on("headers", (headers, req) => {
@@ -37,17 +43,15 @@ io.engine.on("headers", (headers, req) => {
 });
 
 // ==========================
-// MIDDLEWARE
+// MIDDLEWARE — cors called exactly once
 // ==========================
 app.use(cors({ origin: true, credentials: false }));
 app.use(express.json());
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
-
-// Static uploads
 app.use("/uploads", express.static(path.join(__dirname, "../uploads")));
 
 // ==========================
-// MULTER
+// MULTER — file upload
 // ==========================
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -62,48 +66,44 @@ const upload = multer({
 });
 
 // ==========================
+// UDP RELAY — declared here so /end route can call resetPeers()
+// ==========================
+let udpRelay = null;
+
+// ==========================
 // SOCKET.IO CONNECTION HANDLER
 // ==========================
 io.on("connection", (socket) => {
   console.log(
     "🔌 [Socket] connected",
     socket.id,
-    "transport=",
-    socket.conn.transport.name,
-    "origin=",
-    socket.handshake.headers.origin
+    "transport=", socket.conn.transport.name,
+    "origin=",    socket.handshake.headers.origin
   );
 
   socket.conn.on("upgrade", (transport) => {
-    console.log(
-      "🔼 [Socket] transport upgraded",
-      socket.id,
-      "=>",
-      transport.name
-    );
+    console.log("🔼 [Socket] transport upgraded", socket.id, "=>", transport.name);
   });
 
   socket.on("disconnect", (reason) => {
     console.log("🔌 [Socket] disconnected", socket.id, "reason=", reason);
   });
 
+  // Send current session state to newly connected client
   socket.emit("session-status", {
-    active: sessionState.active,
-    status: sessionState.status,
+    active:    sessionState.active,
+    status:    sessionState.status,
     startedAt: sessionState.startedAt,
   });
 
+  // ── Audio relay events ──────────────────────────────────────────────────
   socket.on("audio:owner", (data) => {
-    console.log("🎤 [Audio] owner received", {
-      hasAudio: !!data?.audio,
-      format: data?.format,
-      from: socket.id,
-    });
+    console.log("🎤 [Audio] owner received", { hasAudio: !!data?.audio, format: data?.format, from: socket.id });
     socket.broadcast.emit("audio:owner", data);
   });
 
   socket.on("audio:owner:start", () => {
-    console.log("🎙️ [Audio] owner started talking");
+    console.log("🎙️  [Audio] owner started talking");
     socket.broadcast.emit("audio:owner:start");
   });
 
@@ -113,16 +113,12 @@ io.on("connection", (socket) => {
   });
 
   socket.on("audio:visitor", (data) => {
-    console.log("🎤 [Audio] visitor received", {
-      hasAudio: !!data?.audio,
-      format: data?.format,
-      from: socket.id,
-    });
+    console.log("🎤 [Audio] visitor received", { hasAudio: !!data?.audio, format: data?.format, from: socket.id });
     socket.broadcast.emit("audio:visitor", data);
   });
 
   socket.on("audio:visitor:start", () => {
-    console.log("🎙️ [Audio] visitor started talking");
+    console.log("🎙️  [Audio] visitor started talking");
     socket.broadcast.emit("audio:visitor:start");
   });
 
@@ -143,97 +139,88 @@ io.on("connection", (socket) => {
 });
 
 // ==========================
-// REST ROUTES
+// REST ROUTES — Port 3000
 // ==========================
+
+// Health check
 app.get("/", (req, res) => {
   res.send("Smart Doorbell Backend Running 🚀");
 });
 
+// ESP32 rings the bell
 app.post("/ring", (req, res) => {
   console.log("🔔 [API] Doorbell Ring Received");
 
-  sessionState.active = true;
-  sessionState.status = "ringing";
+  sessionState.active    = true;
+  sessionState.status    = "ringing";
   sessionState.startedAt = Date.now();
 
   io.emit("doorbell:ring", {
-    success: true,
-    message: "Doorbell Ring Received",
-    active: sessionState.active,
-    status: sessionState.status,
+    success:   true,
+    message:   "Doorbell Ring Received",
+    active:    sessionState.active,
+    status:    sessionState.status,
     startedAt: sessionState.startedAt,
   });
 
-  res.json({
-    success: true,
-    message: "Doorbell Ring Received",
-  });
+  res.json({ success: true, message: "Doorbell Ring Received" });
 });
 
+// App polls this every 2s
 app.get("/session-status", (req, res) => {
   res.json({
-    active: sessionState.active,
-    status: sessionState.status,
+    active:    sessionState.active,
+    status:    sessionState.status,
     startedAt: sessionState.startedAt,
   });
 });
 
+// App accepts the call
 app.post("/accept", (req, res) => {
   console.log("✅ [API] Owner Accepted Call");
 
   sessionState.status = "connected";
 
   io.emit("session-status", {
-    active: sessionState.active,
-    status: sessionState.status,
+    active:    sessionState.active,
+    status:    sessionState.status,
     startedAt: sessionState.startedAt,
   });
 
-  res.json({
-    success: true,
-    message: "Call Accepted",
-  });
+  res.json({ success: true, message: "Call Accepted" });
 });
 
+// App or ESP32 ends the call
 app.post("/end", (req, res) => {
   console.log("❌ [API] Call Ended");
 
-  sessionState.active = false;
-  sessionState.status = "idle";
+  sessionState.active    = false;
+  sessionState.status    = "idle";
   sessionState.startedAt = null;
 
-  // Reset UDP peer registry so next call registers fresh IPs
+  // Reset UDP peer registry so the next call registers fresh IPs
   if (udpRelay) udpRelay.resetPeers();
 
   io.emit("session-status", {
-    active: sessionState.active,
-    status: sessionState.status,
+    active:    sessionState.active,
+    status:    sessionState.status,
     startedAt: sessionState.startedAt,
   });
 
-  io.emit("call-ended", {
-    success: true,
-    message: "Call Ended",
-  });
+  io.emit("call-ended", { success: true, message: "Call Ended" });
 
-  res.json({
-    success: true,
-    message: "Call Ended",
-  });
+  res.json({ success: true, message: "Call Ended" });
 });
 
+// ESP32-CAM uploads a snapshot
 app.post("/upload-image", upload.single("image"), (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({
-        success: false,
-        error: "No image file provided",
-      });
+      return res.status(400).json({ success: false, error: "No image file provided" });
     }
 
-    console.log("📸 [API] Image upload received from device");
-    console.log(`    File: ${req.file.originalname}`);
-    console.log(`    Size: ${req.file.size} bytes`);
+    console.log("📸 [API] Image upload received");
+    console.log(`    File: ${req.file.originalname} | Size: ${req.file.size} bytes`);
 
     const result = imageService.saveImage(req.file.buffer, req.file.originalname);
 
@@ -245,34 +232,26 @@ app.post("/upload-image", upload.single("image"), (req, res) => {
     }
   } catch (error) {
     console.error("❌ [API] Upload error:", error.message);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
+// App fetches visitor images
 app.get("/get-images", (req, res) => {
   try {
     const images = imageService.getImages();
-    res.json({
-      success: true,
-      count: images.length,
-      images,
-    });
+    res.json({ success: true, count: images.length, images });
   } catch (error) {
     console.error("❌ [API] Error fetching images:", error.message);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
+// App deletes an image
 app.delete("/delete-image/:filename", (req, res) => {
   try {
     const { filename } = req.params;
-    const result = imageService.deleteImage(filename);
+    const result       = imageService.deleteImage(filename);
 
     if (result.success) {
       io.emit("image-deleted", { filename });
@@ -282,52 +261,57 @@ app.delete("/delete-image/:filename", (req, res) => {
     }
   } catch (error) {
     console.error("❌ [API] Error deleting image:", error.message);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
+// ==========================
+// SESSION AUTO-TIMEOUT
+// Resets a ringing session that nobody answered within 60 seconds
+// ==========================
 setInterval(() => {
   if (sessionState.active && sessionState.status === "ringing") {
-    const currentTime = Date.now();
-    const diff = currentTime - sessionState.startedAt;
+    const elapsed = Date.now() - sessionState.startedAt;
+    if (elapsed > 60000) {
+      console.log("⌛ [Session] No response — auto-closing session");
 
-    if (diff > 60000) {
-      console.log("⌛ [Session] No response. Session auto closed.");
-      sessionState.active = false;
-      sessionState.status = "idle";
+      sessionState.active    = false;
+      sessionState.status    = "idle";
       sessionState.startedAt = null;
 
+      if (udpRelay) udpRelay.resetPeers();
+
       io.emit("session-status", {
-        active: sessionState.active,
-        status: sessionState.status,
+        active:    sessionState.active,
+        status:    sessionState.status,
         startedAt: sessionState.startedAt,
       });
     }
   }
 }, 5000);
 
-const PORT = process.env.PORT || 3000;
-const HOST = process.env.HOST || "0.0.0.0";
-
+// ==========================
+// SERVER EVENTS
+// ==========================
 server.on("upgrade", (req, socket, head) => {
-  console.log("⬆️ HTTP upgrade request", { url: req.url, origin: req.headers.origin });
+  console.log("⬆️  HTTP upgrade request", { url: req.url, origin: req.headers.origin });
 });
 
 server.on("error", (error) => {
   console.error("❌ Server error:", error);
 });
 
-// ── Start UDP Audio Relay ──────────────────────────────────────────────────
-let udpRelay = null;
+// ==========================
+// START — HTTP (Port 3000) + UDP (Port 4000)
+// ==========================
+const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || "0.0.0.0";
 
 server.listen(PORT, HOST, () => {
-  console.log(`🚀 Server running on http://${HOST}:${PORT}`);
+  console.log(`🚀 HTTP server running on http://${HOST}:${PORT}`);
   console.log(`📡 Socket.IO path: /socket.io`);
-  console.log(`🎯 Socket.IO transports: polling, websocket`);
+  console.log(`🎯 Transports: polling, websocket`);
 
-  // Start UDP relay after HTTP server is ready
+  // Start UDP audio relay on port 4000 after HTTP is ready
   udpRelay = startUdpRelay();
 });
