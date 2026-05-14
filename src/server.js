@@ -1,21 +1,47 @@
 // ==========================
 // IMPORTS — declared once at the top
 // ==========================
-const express    = require("express");
-const cors       = require("cors");
-const path       = require("path");
-const http       = require("http");
-const multer     = require("multer");
+const express = require("express");
+const cors = require("cors");
+const path = require("path");
+const http = require("http");
+const multer = require("multer");
 const { Server } = require("socket.io");
 
-const sessionState          = require("./sessionStore");
-const imageService          = require("./services/imageService");
-const { startUdpRelay }     = require("./udpRelay");
+const sessionState = require("./sessionStore");
+const imageService = require("./services/imageService");
+const { startUdpRelay } = require("./udpRelay");
+
+// ==========================
+// DEVICE HEARTBEAT TRACKING
+// Tracks last-seen timestamp for each hardware device
+// ==========================
+const deviceHeartbeat = {
+  audio: null, // timestamp of last ping from Visions_AUDIO (null = never seen)
+  cam: null, // timestamp of last ping from Visions_CAM  (null = never seen)
+};
+const DEVICE_ONLINE_THRESHOLD_MS = 20000; // device considered live if pinged within 20s
+
+/**
+ * 3-state device status:
+ *   'live'    — pinged within DEVICE_ONLINE_THRESHOLD_MS
+ *   'offline' — was seen before but went silent
+ *   'never'   — null (never sent a single ping since server start)
+ */
+function getDeviceStatus(lastSeen) {
+  if (lastSeen === null) return 'never';
+  return (Date.now() - lastSeen) < DEVICE_ONLINE_THRESHOLD_MS ? 'live' : 'offline';
+}
+
+// Backward-compat helper — still used by a few places
+function isDeviceOnline(lastSeen) {
+  return getDeviceStatus(lastSeen) === 'live';
+}
 
 // ==========================
 // APP + HTTP SERVER
 // ==========================
-const app    = express();
+const app = express();
 const server = http.createServer(app);
 
 // ==========================
@@ -79,20 +105,20 @@ function endCallSession(reason) {
 
   console.log(`🔴 [Session] endCallSession called — reason: ${reason}`);
 
-  sessionState.active    = false;
-  sessionState.status    = "idle";
+  sessionState.active = false;
+  sessionState.status = "idle";
   sessionState.startedAt = null;
 
   if (udpRelay) udpRelay.resetPeers();
 
   io.emit("session-status", {
-    active:      false,
-    status:      "idle",
-    startedAt:   null,
+    active: false,
+    status: "idle",
+    startedAt: null,
     pollInterval: 5000,
   });
-  io.emit("call:ended",  { reason, message: "Session ended" });
-  io.emit("call-ended",  { reason, message: "Session ended" });
+  io.emit("call:ended", { reason, message: "Session ended" });
+  io.emit("call-ended", { reason, message: "Session ended" });
 }
 
 // ==========================
@@ -103,7 +129,7 @@ io.on("connection", (socket) => {
     "🔌 [Socket] connected",
     socket.id,
     "transport=", socket.conn.transport.name,
-    "origin=",    socket.handshake.headers.origin
+    "origin=", socket.handshake.headers.origin
   );
 
   socket.conn.on("upgrade", (transport) => {
@@ -130,9 +156,9 @@ io.on("connection", (socket) => {
 
   // Send current session state to newly connected client
   socket.emit("session-status", {
-    active:      sessionState.active,
-    status:      sessionState.status,
-    startedAt:   sessionState.startedAt,
+    active: sessionState.active,
+    status: sessionState.status,
+    startedAt: sessionState.startedAt,
     pollInterval: sessionState.status === "ringing" ? 1000 : 5000,
   });
 
@@ -222,7 +248,7 @@ app.get("/latest-image.jpg", (req, res) => {
       return res.status(404).json({ error: "No images available" });
     }
     const latest = images[0];
-    const url    = latest.url?.startsWith("http")
+    const url = latest.url?.startsWith("http")
       ? latest.url
       : `http://54.237.213.192:3000${latest.url}`;
     // Cache-busting query param is ignored by the server — just redirect
@@ -232,49 +258,125 @@ app.get("/latest-image.jpg", (req, res) => {
   }
 });
 
-// ESP32 rings the bell
+// ESP32 rings the bell — STRICTLY only triggers for 'Visions_AUDIO' device
+// Requests without deviceId or with any other deviceId are rejected.
 app.post("/ring", (req, res) => {
-  console.log("🔔 [API] Doorbell Ring Received");
+  const deviceId = req.body?.deviceId || req.query?.deviceId || null;
 
-  sessionState.active    = true;
-  sessionState.status    = "ringing";
-  sessionState.startedAt = Date.now();
+  // ── Strict Device Identity Filter ──────────────────────────────────────
+  // Only 'Visions_AUDIO' is authorised — no deviceId = rejected too.
+  if (deviceId !== "Visions_AUDIO") {
+    console.log(`⛔ [API] /ring blocked — deviceId='${deviceId}' (only Visions_AUDIO allowed)`);
+    return res.status(403).json({ success: false, message: "Unauthorized device — only Visions_AUDIO may ring" });
+  }
 
+  // ── Global Heartbeat Stamp ─────────────────────────────────────────────
+  // Any /ring from Visions_AUDIO is proof the device is live right now.
+  // Stamp immediately so the UI shows 'live' without waiting for /status/audio.
+  deviceHeartbeat.audio = Date.now();
+
+  console.log(`🔔 [API] Doorbell Ring Received from ${deviceId}`);
+
+  // ── FORCE-RESET: Always reset to ringing, regardless of previous state ──
+  // This fixes the hardware-restart glitch where the popup wouldn't reappear
+  // because the old session was stuck in a non-idle state.
+  const prevStatus = sessionState.status;
+  const ringId = Date.now(); // unique ID per ring — lets App detect fresh rings
+
+  sessionState.active = true;
+  sessionState.status = "ringing";
+  sessionState.startedAt = ringId;
+
+  console.log(`🔄 [Session] Force-reset: '${prevStatus}' → 'ringing' (ringId=${ringId})`);
+
+  // Emit with a unique ringId so the App can always detect this as a NEW ring
+  // even if it was already showing the modal (prevents stale-state glitch).
   io.emit("doorbell:ring", {
-    success:   true,
-    message:   "Doorbell Ring Received",
-    active:    sessionState.active,
-    status:    sessionState.status,
-    startedAt: sessionState.startedAt,
+    success: true,
+    message: "Doorbell Ring Received",
+    active: true,
+    status: "ringing",
+    startedAt: ringId,
+    ringId,            // ← unique per ring — App uses this to force-refresh modal
+    deviceId,
   });
 
-  res.json({ success: true, message: "Doorbell Ring Received" });
+  res.json({ success: true, message: "Doorbell Ring Received", deviceId, ringId });
 });
 
 // App polls this every 2s — pollInterval tells the client how often to poll
+// audioStatus / camStatus: 'live' | 'offline' | 'never'
+// Raw timestamps also included so the App can compute its own threshold if needed.
 app.get("/session-status", (req, res) => {
   const s = sessionState.status || "idle";
   res.json({
-    active:       sessionState.active,
-    status:       s,
-    startedAt:    sessionState.startedAt,
+    active: sessionState.active,
+    status: s,
+    startedAt: sessionState.startedAt,
     pollInterval: s === "ringing" ? 1000 : 5000, // ms
+    // 3-state device status for LED indicators
+    audioStatus: getDeviceStatus(deviceHeartbeat.audio), // 'live'|'offline'|'never'
+    camStatus: getDeviceStatus(deviceHeartbeat.cam),   // 'live'|'offline'|'never'
+    // Raw timestamps — App may use for debugging
+    audioLastSeen: deviceHeartbeat.audio,
+    camLastSeen: deviceHeartbeat.cam,
+    // Backward-compat booleans (kept so old code doesn't break)
+    isAudioOnline: isDeviceOnline(deviceHeartbeat.audio),
+    isCamOnline: isDeviceOnline(deviceHeartbeat.cam),
   });
 });
+
+// ── Hardware Heartbeat Routes ────────────────────────────────────────────────
+// Supports both GET and POST so different ESP32 firmwares can use either method.
+
+// Audio unit (Visions_AUDIO) heartbeat
+function handleAudioHeartbeat(req, res) {
+  deviceHeartbeat.audio = Date.now();
+  const s = sessionState.status || "idle";
+  const oledMessages = { idle: "READY", ringing: "CALLING...", connected: "CALL CONNECTED" };
+  console.log("🔔 [Heartbeat] Audio device ping");
+  res.json({
+    status: s,
+    active: sessionState.active,
+    oledMessage: oledMessages[s] || "READY",
+    startedAt: sessionState.startedAt,
+    pollInterval: s === "ringing" ? 1000 : 5000,
+    online: true,
+    serverTime: Date.now(),
+  });
+}
+app.get("/status/audio", handleAudioHeartbeat);
+app.post("/status/audio", handleAudioHeartbeat);
+
+// Camera unit (Visions_CAM) heartbeat
+function handleCamHeartbeat(req, res) {
+  deviceHeartbeat.cam = Date.now();
+  const s = sessionState.status || "idle";
+  console.log("📷 [Heartbeat] Camera device ping");
+  res.json({
+    status: s,
+    active: sessionState.active,
+    startedAt: sessionState.startedAt,
+    online: true,
+    serverTime: Date.now(),
+  });
+}
+app.get("/status/cam", handleCamHeartbeat);
+app.post("/status/cam", handleCamHeartbeat);
 
 // Hardware /status — ESP32 polls this to update its OLED display
 app.get("/status", (req, res) => {
   const oledMessages = {
-    idle:      "READY",
-    ringing:   "CALLING...",
+    idle: "READY",
+    ringing: "CALLING...",
     connected: "CALL CONNECTED",
   };
   const s = sessionState.status || "idle";
   res.json({
-    status:       s,
-    active:       sessionState.active,
-    oledMessage:  oledMessages[s] || "READY",
-    startedAt:    sessionState.startedAt,
+    status: s,
+    active: sessionState.active,
+    oledMessage: oledMessages[s] || "READY",
+    startedAt: sessionState.startedAt,
     pollInterval: s === "ringing" ? 1000 : 5000, // ms — hardware adapts its poll rate
   });
 });
@@ -286,8 +388,8 @@ app.post("/accept", (req, res) => {
   sessionState.status = "connected";
 
   io.emit("session-status", {
-    active:    sessionState.active,
-    status:    sessionState.status,
+    active: sessionState.active,
+    status: sessionState.status,
     startedAt: sessionState.startedAt,
   });
 
@@ -298,28 +400,28 @@ app.post("/accept", (req, res) => {
 app.post("/answer-call", (req, res) => {
   console.log("📞 [API] Answer-Call received — handshaking with hardware");
 
-  sessionState.active    = true;
-  sessionState.status    = "connected";
+  sessionState.active = true;
+  sessionState.status = "connected";
   // Keep startedAt from ring event, don't reset it
 
   // Notify all Socket.IO clients (app + any monitors)
   io.emit("session-status", {
-    active:    sessionState.active,
-    status:    sessionState.status,
+    active: sessionState.active,
+    status: sessionState.status,
     startedAt: sessionState.startedAt,
   });
 
   // Dedicated event — ESP32 polls /session-status and sees 'connected'
   // Hardware OLED will show CALL CONNECTED when it next polls
   io.emit("call:connected", {
-    message:   "CALL CONNECTED",
+    message: "CALL CONNECTED",
     timestamp: Date.now(),
   });
 
   res.json({
-    success:   true,
-    message:   "Call Connected",
-    status:    sessionState.status,
+    success: true,
+    message: "Call Connected",
+    status: sessionState.status,
     timestamp: Date.now(),
   });
 });
@@ -328,20 +430,20 @@ app.post("/answer-call", (req, res) => {
 app.post("/end", (req, res) => {
   console.log("❌ [API] Call Ended (/end)");
 
-  sessionState.active    = false;
-  sessionState.status    = "idle";
+  sessionState.active = false;
+  sessionState.status = "idle";
   sessionState.startedAt = null;
 
   if (udpRelay) udpRelay.resetPeers();
 
   io.emit("session-status", {
-    active:    sessionState.active,
-    status:    sessionState.status,
+    active: sessionState.active,
+    status: sessionState.status,
     startedAt: sessionState.startedAt,
   });
 
   io.emit("call-ended", { success: true, message: "Call Ended" });
-  io.emit("call:ended",  { success: true, message: "Call Ended" });
+  io.emit("call:ended", { success: true, message: "Call Ended" });
 
   res.json({ success: true, message: "Call Ended" });
 });
@@ -350,39 +452,46 @@ app.post("/end", (req, res) => {
 app.post("/end-call", (req, res) => {
   console.log("📵 [API] End-Call received from app");
 
-  sessionState.active    = false;
-  sessionState.status    = "idle";
+  sessionState.active = false;
+  sessionState.status = "idle";
   sessionState.startedAt = null;
 
   if (udpRelay) udpRelay.resetPeers();
 
   io.emit("session-status", {
-    active:    sessionState.active,
-    status:    sessionState.status,
+    active: sessionState.active,
+    status: sessionState.status,
     startedAt: sessionState.startedAt,
   });
 
   // Both event names for backward compat
   io.emit("call-ended", { success: true, message: "Call Ended" });
-  io.emit("call:ended",  { success: true, message: "Call Ended" });
+  io.emit("call:ended", { success: true, message: "Call Ended" });
 
   res.json({ success: true, message: "Call Ended", status: "idle" });
 });
 
 // ESP32-CAM uploads a snapshot
+// NOTE: Image upload does NOT trigger doorbell:ring — it only updates the camera feed.
+//       We do stamp deviceHeartbeat.cam immediately so the UI shows 'live' without
+//       waiting for a separate /status/cam ping from the camera firmware.
 app.post("/upload-image", upload.single("image"), (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, error: "No image file provided" });
     }
 
-    console.log("📸 [API] Image upload received");
+    // ── Global Heartbeat Stamp ───────────────────────────────────────────
+    // Any image upload is proof Visions_CAM is alive right now.
+    deviceHeartbeat.cam = Date.now();
+
+    console.log("📸 [API] Image upload received — cam heartbeat stamped");
     console.log(`    File: ${req.file.originalname} | Size: ${req.file.size} bytes`);
 
     const result = imageService.saveImage(req.file.buffer, req.file.originalname);
 
     if (result.success) {
-      io.emit("new-image", result);
+      io.emit("new-image", result); // ← only new-image, never doorbell:ring
       res.json(result);
     } else {
       res.status(500).json(result);
@@ -408,7 +517,7 @@ app.get("/get-images", (req, res) => {
 app.delete("/delete-image/:filename", (req, res) => {
   try {
     const { filename } = req.params;
-    const result       = imageService.deleteImage(filename);
+    const result = imageService.deleteImage(filename);
 
     if (result.success) {
       io.emit("image-deleted", { filename });
@@ -433,18 +542,18 @@ setInterval(() => {
     if (elapsed > 30000) {  // 30 seconds
       console.log("⏳ [Session] 30s timeout — no answer, resetting to idle");
 
-      sessionState.active    = false;
-      sessionState.status    = "idle";
+      sessionState.active = false;
+      sessionState.status = "idle";
       sessionState.startedAt = null;
 
       if (udpRelay) udpRelay.resetPeers();
 
       // Notify app — triggers auto navigate-back on LiveCall screen
-      io.emit("call:ended",  { reason: "timeout", message: "No answer — session closed" });
-      io.emit("call-ended",  { reason: "timeout", message: "No answer — session closed" });
+      io.emit("call:ended", { reason: "timeout", message: "No answer — session closed" });
+      io.emit("call-ended", { reason: "timeout", message: "No answer — session closed" });
       io.emit("session-status", {
-        active:    sessionState.active,
-        status:    sessionState.status,
+        active: sessionState.active,
+        status: sessionState.status,
         startedAt: sessionState.startedAt,
       });
     }
